@@ -112,7 +112,7 @@ class RL_DIV(nn.Module):
     def forward(self, x, z):
         z0 = self.conv1(z)
         z1 = torch.mean(z0, dim=1, keepdim=True)
-        q =  x/(z1 + 1e-12)
+        q =  x/(z1 + 1e-4)
         z2 = self.conv2(q)
         
         return z2
