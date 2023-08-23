@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torchmetrics import PeakSignalNoiseRatio
+from torchmetrics.image import PeakSignalNoiseRatio
 from utils.ssim import get_SSIM
 from lucyd import LUCYD
 from torchvision import models, transforms, datasets
@@ -10,14 +10,37 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import wandb
+from types import SimpleNamespace
+import torchvision.transforms.functional as TF
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir_blurred, data_dir_gt, filenames, transform):
+    def __init__(self, data_dir_blurred, data_dir_gt, filenames):
         self.data_dir_blurred = data_dir_blurred
         self.data_dir_gt = data_dir_gt
         self.filenames = filenames
-        self.transform = transform
+        #self.transform = transform
+    
+    def transform(self, blurred, gt):
+        # # Resize
+        # resize = transforms.Resize(size=(520, 520))
+        # image = resize(image)
+        # mask = resize(mask)
+
+        # Random crop
+        i, j, h, w = transforms.RandomCrop.get_params(
+            blurred, output_size=config.img_size)
+        blurred = TF.crop(blurred, i, j, h, w)
+        gt = TF.crop(gt, i, j, h, w)
+
+        # Transform to tensor
+        blurred = TF.to_tensor(blurred)
+        gt = TF.to_tensor(gt)
+
+        blurred = blurred
+        gt = gt
+
+        return blurred, gt
         
     def __len__(self):
         return len(self.filenames)
@@ -28,11 +51,9 @@ class CustomDataset(torch.utils.data.Dataset):
         image_path_gt = os.path.join(self.data_dir_gt, image_name)
         
         image_blurred = Image.open(image_path_blurred).convert("L")  # Convert to grayscale
-        input_image = self.transform(image_blurred)
-        
         image_gt = Image.open(image_path_gt).convert("L")
-        gt_image = self.transform(image_gt)
-        
+        input_image, gt_image = self.transform(image_blurred, image_gt)
+                
         return input_image, gt_image
 
 def train(model, train_dataloader, val_dataloader):
@@ -66,18 +87,20 @@ def train(model, train_dataloader, val_dataloader):
 
             train_loss.append(loss.item())
 
-            if train_loss < best_loss:
-            print(f'New best loss: {train_loss}, saving model state...')
-            best_loss = train_loss
-            torch.save(model.state_dict(), '/home/plankton/underwater-lucyd/models/lucyd-edof-plankton_best_loss.pth')
+        print('train loss: {}'.format(np.mean(np.array(train_loss))))
 
-            metrics = {
-                "train/train_loss": train_loss,
+        epoch_loss = np.mean(np.array(train_loss))
+
+        if epoch_loss < best_loss:
+            print(f'New best loss: {np.mean(np.array(train_loss))}, saving model state...')
+            best_loss = epoch_loss
+            torch.save(model.state_dict(), '/home/plankton/underwater-lucyd/models/lucyd-edof-plankton_best_train_loss.pth')
+
+        metrics = {
+                "train/train_loss": np.mean(np.array(train_loss)),
                 "train/epoch": epoch + 1,
             }
-            wandb.log(metrics)
-
-        print('train loss: {}'.format(np.mean(np.array(train_loss))))
+        wandb.log(metrics)
 
         if (epoch % 5 == 0) or (epoch + 1 == epochs):
             model.eval()
@@ -95,13 +118,13 @@ def train(model, train_dataloader, val_dataloader):
                 val_ssim.append(get_SSIM(y, y_hat).item())
                 val_psnr.append(psnr(y, y_hat).item())
 
-                val_metrics = {
-                "val/val_loss": val_loss,
-                "val/val_ssim": val_ssim,
-                "val/val_psnr": val_psnr,
+            val_metrics = {
+                "val/val_loss": np.mean(np.array(val_loss)),
+                "val/val_ssim": np.round(np.mean(np.array(val_ssim)), 5),
+                "val/val_psnr": np.round(np.mean(np.array(val_psnr))),
                 "val/epoch": epoch + 1,
                 }
-                wandb.log(metrics)
+            wandb.log(val_metrics)
 
             print('testing loss: {}'.format(np.mean(np.array(val_loss))))
             print('testing ssim: {} +- {}'.format(np.round(np.mean(np.array(val_ssim)), 5), np.round(np.std(np.array(val_ssim)), 5)))
@@ -115,14 +138,14 @@ if __name__ == "__main__":
 
     # Let's define a config object to store our hyperparameters
     config = SimpleNamespace(
-        epochs = 200,
+        epochs = 100,
         batch_size = 4,
-        img_size = (512,512)
+        img_size = (512,512),
         lr = 1e-3,
         betas = (0.9, 0.999),
         valid_pct = 0.2,
-        start_ckpt = '/home/plankton/underwater-lucyd/models/lucyd-psf-sim-2.pth'
-        best_loss = 0.03866
+        start_ckpt = '/home/plankton/underwater-lucyd/models/lucyd-edof-plankton_best_train_loss.pth',
+        best_loss = 0.03866,
     )
     model = LUCYD(num_res=1).to(device)
     model.load_state_dict(torch.load(config.start_ckpt))
@@ -133,15 +156,16 @@ if __name__ == "__main__":
     blurred_filenames = os.listdir(data_dir_blurred)
     train_blurred_filenames, val_blurred_filenames = train_test_split(blurred_filenames, test_size=config.valid_pct, random_state=42)  # Adjust test_size and random_state
 
-    data_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-        transforms.Resize(config.img_size)
-    ])
+    # data_transform = transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.5], [0.5]),
+    #     #transforms.Resize(config.img_size),
+    #     transforms.RandomCrop(size=config.img_size)
+    # ])
 
     image_datasets = {
-        'train': CustomDataset(data_dir_blurred, data_dir_gt, train_blurred_filenames, data_transform),
-        'val': CustomDataset(data_dir_blurred, data_dir_gt, val_blurred_filenames, data_transform)
+        'train': CustomDataset(data_dir_blurred, data_dir_gt, train_blurred_filenames),
+        'val': CustomDataset(data_dir_blurred, data_dir_gt, val_blurred_filenames)
     }
 
     dataloaders = {
